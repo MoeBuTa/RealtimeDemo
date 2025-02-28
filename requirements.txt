@@ -1,0 +1,8 @@
+openai
+loguru
+pandas
+requests
+pyyaml==6.0.2
+sounddevice
+isort
+openai[realtime]
