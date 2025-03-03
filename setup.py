@@ -1,12 +1,12 @@
 from setuptools import find_packages, setup
 
 setup(
-    name="omni",
+    name="realtime",
     version="0.0.1",
     packages=find_packages(),
     entry_points={
         'console_scripts': [
-            'omni=omni.run:main',  # This makes the 'omni' command available
+            'realtime=realtime.run:main',  # This makes the 'omni' command available
         ],
     },
     python_requires='>=3.10',  # Adjust based on your needs

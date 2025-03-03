@@ -1,6 +1,6 @@
 from loguru import logger
 
-from omni.run import main
+from realtime.run import main
 
 if __name__ == '__main__':
     try:

@@ -6,3 +6,8 @@ pyyaml==6.0.2
 sounddevice
 isort
 openai[realtime]
+pyaudio
+websocket-client>=1.6.1
+numpy>=1.22.0
+sounddevice>=0.4.6
+soundfile>=0.12.1

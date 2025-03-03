@@ -1,1 +1,4 @@
 # RealtimeDemo
+
+
+brew install portaudio
