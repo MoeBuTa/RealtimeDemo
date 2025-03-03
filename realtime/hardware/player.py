@@ -1,22 +1,30 @@
 import base64
-
-import os
 import queue
 import threading
 import time
-
+import numpy as np
 import sounddevice as sd
 import soundfile as sf
 from loguru import logger
+import io
+import wave
 
 
 class AudioPlayer:
-    """Handles streaming audio playback from the API responses"""
+    """Handles streaming audio playback from the API responses with improved buffering"""
 
-    def __init__(self):
+    def __init__(self, buffer_size=10, sample_rate=24000):
         self.audio_queue = queue.Queue()
         self.is_playing = False
         self.playback_thread = None
+        self.buffer_size = buffer_size  # Number of chunks to buffer before playback
+        self.sample_rate = sample_rate  # Default sample rate for OpenAI audio
+        self.audio_buffer = None  # NumPy buffer for continuous playback
+        self.buffer_event = threading.Event()  # Signal when buffer is ready
+
+        # Stream parameters
+        self.stream = None
+        self.stream_lock = threading.Lock()
 
     def start(self):
         """Start the audio playback thread"""
@@ -30,112 +38,135 @@ class AudioPlayer:
     def stop(self):
         """Stop audio playback"""
         self.is_playing = False
+
+        # Close the stream if it exists
+        with self.stream_lock:
+            if self.stream is not None and self.stream.active:
+                self.stream.stop()
+                self.stream.close()
+                self.stream = None
+
         if self.playback_thread and self.playback_thread.is_alive():
             self.playback_thread.join(1.0)
+
         logger.info("Audio playback stopped")
 
     def add_audio(self, base64_audio: str):
         """Add base64 encoded audio to the playback queue for streaming"""
         try:
-            # Log audio content size for debugging
-            logger.info(f"Received audio chunk of size: {len(base64_audio)} bytes")
-
             audio_data = base64.b64decode(base64_audio)
-            logger.info(f"Decoded audio data size: {len(audio_data)} bytes")
 
-            self.audio_queue.put(audio_data)
-            logger.info("Audio chunk added to playback queue")
+            # Decode the audio data to numpy array for efficient processing
+            samples = self._decode_audio(audio_data)
+            if samples is not None:
+                self.audio_queue.put(samples)
+                logger.debug(f"Audio chunk added to playback queue: {len(samples)} samples")
+
         except Exception as e:
             logger.exception(f"Error decoding audio: {e}")
 
-    def _playback_worker(self):
-        """Worker thread that streams audio from the queue to the speakers"""
-
-        # Function to save audio data to WAV file with proper headers
-        def save_audio_to_wav(audio_data, filename):
-            try:
-                import wave
-                import struct
-
-                # Define WAV parameters
-                channels = 1  # Mono
-                sample_width = 2  # 2 bytes per sample (16-bit)
-                sample_rate = 24000  # OpenAI default is 24kHz
-
-                with wave.open(filename, 'wb') as wav_file:
-                    wav_file.setnchannels(channels)
-                    wav_file.setsampwidth(sample_width)
-                    wav_file.setframerate(sample_rate)
-                    wav_file.writeframes(audio_data)
-
-                logger.info(f"Audio saved to {filename} with proper WAV headers")
-                return True
-            except Exception as e:
-                logger.exception(f"Error saving audio to WAV: {e}")
-                return False
-
+    def _decode_audio(self, audio_data):
+        """Decode audio data to a numpy array"""
         try:
-            while self.is_playing:
-                if not self.audio_queue.empty():
-                    logger.info("Getting audio chunk from queue for playback")
-                    audio_data = self.audio_queue.get()
-                    logger.info(f"Processing audio chunk of size: {len(audio_data)} bytes")
+            # Check if data has WAV headers
+            if audio_data.startswith(b'RIFF') and b'WAVE' in audio_data[:12]:
+                # Use soundfile to read WAV data directly from bytes
+                with io.BytesIO(audio_data) as buf:
+                    samples, _ = sf.read(buf)
+                    return samples
+            else:
+                # Assume it's raw PCM 16-bit mono at 24kHz
+                # Create a WAV in memory to parse it properly
+                with io.BytesIO() as wav_io:
+                    with wave.open(wav_io, 'wb') as wav_file:
+                        wav_file.setnchannels(1)  # Mono
+                        wav_file.setsampwidth(2)  # 16-bit
+                        wav_file.setframerate(self.sample_rate)
+                        wav_file.writeframes(audio_data)
 
-                    # Determine if this is raw audio data or already has WAV headers
-                    has_wav_header = audio_data.startswith(b'RIFF') and b'WAVE' in audio_data[:12]
-                    logger.info(f"Audio data {'has' if has_wav_header else 'does not have'} WAV headers")
+                    wav_io.seek(0)
+                    samples, _ = sf.read(wav_io)
+                    return samples
 
-                    # Create a temporary file to write the audio data
-                    temp_file = "temp_audio.wav"
-
-                    if has_wav_header:
-                        # Direct write if it already has WAV headers
-                        with open(temp_file, "wb") as f:
-                            f.write(audio_data)
-                        logger.info(f"Audio data with WAV headers written to file: {temp_file}")
-                    else:
-                        # Save with proper WAV headers if it's raw audio
-                        success = save_audio_to_wav(audio_data, temp_file)
-                        if not success:
-                            logger.warning("Falling back to direct write method")
-                            with open(temp_file, "wb") as f:
-                                f.write(audio_data)
-
-                    # For debugging, save a copy of the audio file
-                    debug_file = f"debug_audio_{int(time.time())}.wav"
-                    import shutil
-                    shutil.copy(temp_file, debug_file)
-                    logger.info(f"Debug copy saved to {debug_file}")
-
-                    # Read and play the audio
-                    try:
-                        logger.info("Reading audio file with soundfile...")
-                        data, samplerate = sf.read(temp_file)
-                        logger.info(f"Audio file read: {data.shape} samples at {samplerate}Hz")
-
-                        logger.info("Playing audio through sounddevice...")
-                        sd.play(data, samplerate)
-                        sd.wait()  # Wait until audio is done playing
-                        logger.info("Audio playback completed")
-                    except Exception as e:
-                        logger.exception(f"Error playing audio: {e}")
-
-                        # Try alternative playback method if the first one fails
-                        try:
-                            logger.info("Trying alternative playback method with afplay (Mac OS X)...")
-                            import subprocess
-                            subprocess.run(["afplay", temp_file], check=True)
-                            logger.info("Alternative playback completed")
-                        except Exception as alt_e:
-                            logger.exception(f"Alternative playback also failed: {alt_e}")
-
-                    # Clean up the temporary file
-                    try:
-                        os.remove(temp_file)
-                        logger.debug(f"Temporary file {temp_file} removed")
-                    except Exception as e:
-                        logger.warning(f"Could not remove temp file: {e}")
-                else:
-                    time.sleep(0.05)  # Short sleep to reduce CPU usage
         except Exception as e:
-            logger.exception(f"Playback error: {e}")
+            logger.exception(f"Error decoding audio data: {e}")
+            return None
+
+    def _callback(self, outdata, frames, time, status):
+        """Callback for the sounddevice OutputStream"""
+        if status:
+            logger.warning(f"Sounddevice status: {status}")
+
+        # If we have data in our buffer, play it
+        if self.audio_buffer is not None and len(self.audio_buffer) > 0:
+            if len(self.audio_buffer) >= frames:
+                # We have enough data
+                outdata[:] = self.audio_buffer[:frames].reshape(-1, 1)
+                # Remove the data we just played
+                self.audio_buffer = self.audio_buffer[frames:]
+            else:
+                # Not enough data, pad with zeros
+                outdata[:len(self.audio_buffer)] = self.audio_buffer.reshape(-1, 1)
+                outdata[len(self.audio_buffer):] = 0
+                self.audio_buffer = np.array([])
+
+            if len(self.audio_buffer) == 0:
+                # Signal that we need more data
+                self.buffer_event.clear()
+        else:
+            # No data available, output silence
+            outdata.fill(0)
+            # Signal that we need data
+            self.buffer_event.clear()
+
+    def _playback_worker(self):
+        """Worker thread that manages continuous audio playback"""
+        try:
+            # Initialize audio buffer
+            self.audio_buffer = np.array([])
+
+            # Create and start the output stream
+            with self.stream_lock:
+                self.stream = sd.OutputStream(
+                    samplerate=self.sample_rate,
+                    channels=1,
+                    callback=self._callback,
+                    blocksize=1024  # Smaller blocksize for more responsive playback
+                )
+                self.stream.start()
+
+            logger.info("Audio playback stream started")
+
+            while self.is_playing:
+                # Check if we need to fill the buffer
+                if len(self.audio_buffer) < self.sample_rate * 0.5:  # Buffer less than 0.5 seconds
+                    # Try to get more audio data
+                    try:
+                        # Non-blocking get with timeout
+                        samples = self.audio_queue.get(timeout=0.1)
+
+                        # Append to our buffer
+                        if len(samples) > 0:
+                            if len(self.audio_buffer) == 0:
+                                self.audio_buffer = samples
+                            else:
+                                self.audio_buffer = np.append(self.audio_buffer, samples)
+
+                            logger.debug(f"Buffer filled: {len(self.audio_buffer)} samples")
+                            self.buffer_event.set()
+                    except queue.Empty:
+                        # No data available yet, wait a bit
+                        time.sleep(0.01)
+                else:
+                    # Buffer is sufficiently full, wait for it to drain
+                    self.buffer_event.wait(0.1)
+
+        except Exception as e:
+            logger.exception(f"Playback worker error: {e}")
+        finally:
+            # Ensure stream is closed on exit
+            with self.stream_lock:
+                if self.stream is not None and self.stream.active:
+                    self.stream.stop()
+                    self.stream.close()
+                    self.stream = None
