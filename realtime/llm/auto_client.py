@@ -5,20 +5,18 @@ from typing import Dict, Any
 
 import websocket
 
-from realtime.hardware.player import AudioPlayer
-# Import our new automatic recorder instead of the original
+from realtime.hardware.auto_player import AutomaticAudioPlayer
 from realtime.hardware.auto_recorder import AutomaticAudioRecorder
 from realtime.utils.config import REALTIME_URL, HEADERS
 from loguru import logger
 
 
 class AutomaticRealtimeClient:
-    """Client for the OpenAI Realtime API using direct WebSocket connection with automatic voice recording"""
+    """Client for the OpenAI Realtime API with improved barge-in support"""
 
     def __init__(self):
         self.ws = None
-        self.player = AudioPlayer()
-        # Use our automatic recorder instead
+        self.player = AutomaticAudioPlayer()
         self.recorder = AutomaticAudioRecorder(
             threshold=0.02,  # Adjust based on your microphone sensitivity
             silence_duration=1.0,  # Stop recording after 1 second of silence
@@ -28,6 +26,10 @@ class AutomaticRealtimeClient:
         self.connected = False
         self.current_event_id = 0
         self.processing_input = False  # Flag to prevent overlapping processing
+        self.assistant_speaking = False  # Flag to track if assistant is speaking
+        self.current_response_id = None  # Track the current response ID
+        self.expecting_audio = False  # Flag to track if we're expecting new audio
+        self.first_audio_chunk = True  # Flag to track first audio chunk in response
 
     def connect(self):
         """Connect to the Realtime API"""
@@ -41,19 +43,27 @@ class AutomaticRealtimeClient:
                 event = json.loads(message)
                 event_type = event.get("type")
 
-                # Log the full event for debugging purposes
-                try:
-                    event_json = json.dumps(event, indent=2)
-                    if len(event_json) > 1000:
-                        logger.debug(f"Raw event (truncated): {event_json[:500]}...{event_json[-500:]}")
-                    else:
-                        logger.debug(f"Raw event: {event_json}")
-                except:
-                    logger.debug("Could not serialize event to JSON for logging")
+                # Track response ID if present
+                if "response_id" in event:
+                    self.current_response_id = event.get("response_id")
+                    # When a new response is created, set flag to expect audio
+                    if event_type == "response.created":
+                        self.expecting_audio = True
+                        self.first_audio_chunk = True
+                        logger.info("Expecting new audio response")
 
                 # Handle different event types
                 if event_type == "audio.content":
                     logger.info("Received audio content event")
+
+                    # If this is the first audio chunk, force restart the player
+                    if self.first_audio_chunk or self.expecting_audio:
+                        logger.info("First audio chunk received - force restarting player")
+                        self.player.force_restart()
+                        self.first_audio_chunk = False
+                        self.expecting_audio = False
+
+                    self.assistant_speaking = True  # Mark that assistant is speaking
                     audio_content = event.get("audio_content", {})
                     audio_data = audio_content.get("audio", "")
                     logger.info(f"Processing audio content of size: {len(audio_data)} bytes")
@@ -61,6 +71,16 @@ class AutomaticRealtimeClient:
 
                 elif event_type == "response.audio.delta":
                     logger.info("Received audio delta event")
+
+                    # If this is the first audio chunk, force restart the player
+                    if self.first_audio_chunk or self.expecting_audio:
+                        logger.info("First audio delta received - force restarting player")
+                        self.player.force_restart()
+                        self.first_audio_chunk = False
+                        self.expecting_audio = False
+
+                    self.assistant_speaking = True  # Mark that assistant is speaking
+
                     # Get the audio data directly from the delta field
                     audio_data = event.get("delta", "")
                     logger.info(f"Processing audio delta of size: {len(audio_data)} bytes")
@@ -79,8 +99,18 @@ class AutomaticRealtimeClient:
 
                 elif event_type == "response.done":
                     logger.info("Response complete.")
-                    # Reset processing flag when response is complete
+                    # Reset flags when response is complete
                     self.processing_input = False
+                    self.assistant_speaking = False
+                    self.current_response_id = None
+                    self.first_audio_chunk = True
+                    self.expecting_audio = False
+
+                elif event_type == "response.created":
+                    logger.info(f"Response created with ID: {self.current_response_id}")
+                    # Will expect audio for this response
+                    self.expecting_audio = True
+                    self.first_audio_chunk = True
 
                 elif event_type == "session.created":
                     logger.info(f"Session created: {json.dumps(event.get('session', {}), indent=2)}")
@@ -139,8 +169,10 @@ class AutomaticRealtimeClient:
         # Start the audio player
         self.player.start()
 
-        # Set up recorder callback
+        # Set up recorder callback with barge-in support
         self.recorder.set_recording_finished_callback(self.process_recorded_audio)
+        # Set up speech detection callback for barge-in detection
+        self.recorder.set_speech_detected_callback(self.handle_barge_in)
 
     def disconnect(self):
         """Disconnect from the Realtime API"""
@@ -166,6 +198,34 @@ class AutomaticRealtimeClient:
         logger.debug(f"Sending event: {json.dumps(event, indent=2)}")
         self.ws.send(json.dumps(event))
 
+    def handle_barge_in(self):
+        """Handle barge-in with complete player stopping"""
+        if self.assistant_speaking:
+            logger.info("BARGE-IN DETECTED: User started speaking while assistant was talking")
+
+            # Cancel the current response if there is one
+            if self.current_response_id:
+                logger.info(f"Canceling response {self.current_response_id} due to barge-in")
+                try:
+                    self.send_event("response.cancel", {"response_id": self.current_response_id})
+                except Exception as e:
+                    logger.warning(f"Error canceling response: {e}")
+
+            # Force kill the player completely
+            self.player.stop()
+
+            # Wait a small amount of time to ensure clean shutdown
+            time.sleep(0.1)
+
+            # Start a new player instance
+            self.player.start()
+
+            # Reset assistant speaking flag
+            self.assistant_speaking = False
+
+            # Show visual indicator of barge-in
+            print("\n[User interrupted - listening...]")
+
     def process_recorded_audio(self):
         """Process the recorded audio data when recording finished"""
         # Avoid processing multiple inputs simultaneously
@@ -184,6 +244,14 @@ class AutomaticRealtimeClient:
 
             logger.info(f"Processing recorded audio ({len(audio_data)} bytes)...")
 
+            # Completely stop the player for new input
+            if self.assistant_speaking:
+                # Stop the player and wait for it to fully stop
+                self.player.stop()
+                time.sleep(0.1)
+                self.player.start()
+                self.assistant_speaking = False
+
             # Append the audio to the input buffer
             self.send_event("input_audio_buffer.append", {"audio": audio_data})
 
@@ -192,6 +260,10 @@ class AutomaticRealtimeClient:
 
             # Create a response
             self.send_event("response.create")
+
+            # Set flag to expect new audio
+            self.expecting_audio = True
+            self.first_audio_chunk = True
 
             # Clear the recording for the next interaction
             self.recorder.clear_recording()
@@ -203,7 +275,8 @@ class AutomaticRealtimeClient:
     def run_conversation(self):
         """Run an interactive conversation with automatic voice detection"""
         try:
-            print("\nStarting automatic voice detection. Just speak to interact...\n")
+            print("\nStarting automatic voice detection with improved barge-in support.")
+            print("You can interrupt the assistant by speaking while it's talking.")
             print("(Press Ctrl+C to exit)\n")
 
             # Start listening for voice

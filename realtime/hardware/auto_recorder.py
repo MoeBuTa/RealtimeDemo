@@ -10,7 +10,7 @@ from loguru import logger
 
 
 class AutomaticAudioRecorder:
-    """Records audio automatically when speech is detected"""
+    """Records audio automatically when speech is detected with support for barge-in detection"""
 
     def __init__(self, threshold=0.02, sample_rate=16000, channels=1,
                  silence_duration=1.0, min_speech_duration=0.5,
@@ -57,12 +57,17 @@ class AutomaticAudioRecorder:
         # Pre-buffer to keep audio before speech is detected
         self.pre_buffer = collections.deque(maxlen=self.pre_buffer_size)
 
-        # Callback for when recording is finished
+        # Callbacks for various events
         self.recording_finished_callback = None
+        self.speech_detected_callback = None
 
     def set_recording_finished_callback(self, callback):
         """Set callback function to be called when recording is finished"""
         self.recording_finished_callback = callback
+
+    def set_speech_detected_callback(self, callback):
+        """Set callback function to be called when speech is first detected (for barge-in)"""
+        self.speech_detected_callback = callback
 
     def start_listening(self):
         """Start listening for speech"""
@@ -144,6 +149,11 @@ class AutomaticAudioRecorder:
                 self.speech_detected = True
                 self.speech_start_time = time_module.time()
                 self.speech_frames = 1
+
+                # Call the speech detected callback for barge-in detection
+                if self.speech_detected_callback:
+                    # Run in separate thread to avoid blocking audio callback
+                    threading.Thread(target=self.speech_detected_callback).start()
 
                 # Start recording if not already
                 if not self.is_recording:

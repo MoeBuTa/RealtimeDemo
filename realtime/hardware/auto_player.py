@@ -11,7 +11,7 @@ import wave
 
 
 class AutomaticAudioPlayer:
-    """Handles streaming audio playback from the API responses with interruption support"""
+    """Handles streaming audio playback from the API responses with improved force restart capability"""
 
     def __init__(self, buffer_size=10, sample_rate=24000):
         self.audio_queue = queue.Queue()
@@ -26,17 +26,75 @@ class AutomaticAudioPlayer:
         self.stream = None
         self.stream_lock = threading.Lock()
 
-    def start(self):
-        """Start the audio playback thread"""
-        if self.playback_thread is None or not self.playback_thread.is_alive():
+        # Flag to silence output but keep everything running
+        self.silence_output = False
+
+        # Added thread management
+        self.thread_id = 0  # To track thread instances
+        self.current_thread_id = None  # Current active thread
+
+    def force_restart(self):
+        """Forcefully stop current playback and restart the player completely"""
+        logger.info("Forcefully restarting audio player")
+
+        # Force stop the current player completely
+        with self.stream_lock:
+            # Mark current thread as stopped
+            self.is_playing = False
+
+            # Close the stream if it exists
+            if self.stream is not None and self.stream.active:
+                try:
+                    self.stream.stop()
+                    self.stream.close()
+                except Exception as e:
+                    logger.warning(f"Error stopping stream: {e}")
+                finally:
+                    self.stream = None
+
+            # Clear the queue completely
+            self._clear_queue()
+
+            # Reset audio buffer
+            self.audio_buffer = np.array([])
+
+            # Create a new thread ID
+            self.thread_id += 1
+            new_thread_id = self.thread_id
+
+            # Start a new playback thread with the new ID
             self.is_playing = True
-            self.playback_thread = threading.Thread(target=self._playback_worker)
+            self.silence_output = False
+            self.current_thread_id = new_thread_id
+            self.playback_thread = threading.Thread(
+                target=self._playback_worker,
+                args=(new_thread_id,),
+                name=f"playback-{new_thread_id}"
+            )
             self.playback_thread.daemon = True
             self.playback_thread.start()
-            logger.info("Audio playback system ready")
+
+            logger.info(f"Started new playback thread ID: {new_thread_id}")
+
+    def start(self):
+        """Start the audio playback thread"""
+        with self.stream_lock:
+            if self.playback_thread is None or not self.playback_thread.is_alive():
+                self.is_playing = True
+                self.silence_output = False
+                self.thread_id += 1
+                self.current_thread_id = self.thread_id
+                self.playback_thread = threading.Thread(
+                    target=self._playback_worker,
+                    args=(self.current_thread_id,),
+                    name=f"playback-{self.current_thread_id}"
+                )
+                self.playback_thread.daemon = True
+                self.playback_thread.start()
+                logger.info(f"Audio playback system ready (thread ID: {self.current_thread_id})")
 
     def stop(self):
-        """Stop audio playback"""
+        """Stop audio playback completely (for shutdown only)"""
         self.is_playing = False
 
         # Close the stream if it exists
@@ -58,48 +116,43 @@ class AutomaticAudioPlayer:
 
         logger.info("Audio playback stopped")
 
-    def interrupt(self):
-        """Interrupt current playback and clear queue for new conversation"""
-        logger.info("Interrupting audio playback for new conversation")
+    def _clear_queue(self):
+        """Clear the audio queue"""
+        try:
+            while not self.audio_queue.empty():
+                self.audio_queue.get_nowait()
+        except Exception:
+            pass
+
+    def stop_current_audio(self):
+        """Simple approach to stop current audio without stopping the process"""
+        logger.info("Stopping current audio playback")
+
+        # Set flag to silence output
+        self.silence_output = True
 
         # Clear the queue
-        while not self.audio_queue.empty():
-            try:
-                self.audio_queue.get_nowait()
-            except queue.Empty:
-                break
+        self._clear_queue()
 
         # Clear the buffer
-        self.audio_buffer = np.array([])
+        with self.stream_lock:
+            self.audio_buffer = np.array([])
 
-        # Optional: Play a short interruption sound
-        # self._play_interruption_sound()
+        # Reset flag after a short delay
+        def reset_flag():
+            time_module.sleep(0.2)  # Short delay to ensure audio is cleared
+            self.silence_output = False
+            logger.info("Audio system ready for new audio")
 
-        logger.info("Audio playback interrupted and queue cleared")
-
-    def _play_interruption_sound(self):
-        """Play a short sound to indicate interruption (optional)"""
-        try:
-            # Create a short beep sound
-            duration = 0.2  # seconds
-            frequency = 880  # Hz (A5)
-            t = np.linspace(0, duration, int(self.sample_rate * duration), False)
-            beep = 0.2 * np.sin(2 * np.pi * frequency * t)  # Quiet beep
-
-            # Fade in/out to avoid clicks
-            fade = 0.05  # seconds
-            fade_samples = int(fade * self.sample_rate)
-            beep[:fade_samples] *= np.linspace(0, 1, fade_samples)
-            beep[-fade_samples:] *= np.linspace(1, 0, fade_samples)
-
-            # Play the beep directly
-            sd.play(beep, self.sample_rate)
-            sd.wait()
-        except Exception as e:
-            logger.warning(f"Could not play interruption sound: {e}")
+        # Start thread to reset flag
+        threading.Thread(target=reset_flag, daemon=True).start()
 
     def add_audio(self, base64_audio: str):
         """Add base64 encoded audio to the playback queue for streaming"""
+        # Skip if we're silencing output
+        if self.silence_output:
+            return
+
         try:
             audio_data = base64.b64decode(base64_audio)
 
@@ -140,47 +193,59 @@ class AutomaticAudioPlayer:
             return None
 
     def _callback(self, outdata, frames, time_info, status):
-        """Callback for the sounddevice OutputStream
-
-        Args:
-            outdata: Output buffer as a numpy array
-            frames: Number of frames to process
-            time_info: Stream timing information (not used directly)
-            status: Status flag indicating underflow/overflow
-        """
+        """Callback for the sounddevice OutputStream"""
         if status:
             logger.warning(f"Sounddevice status: {status}")
 
-        # If we have data in our buffer, play it
-        if self.audio_buffer is not None and len(self.audio_buffer) > 0:
-            if len(self.audio_buffer) >= frames:
-                # We have enough data
-                outdata[:] = self.audio_buffer[:frames].reshape(-1, 1)
-                # Remove the data we just played
-                self.audio_buffer = self.audio_buffer[frames:]
-            else:
-                # Not enough data, pad with zeros
-                outdata[:len(self.audio_buffer)] = self.audio_buffer.reshape(-1, 1)
-                outdata[len(self.audio_buffer):] = 0
-                self.audio_buffer = np.array([])
-
-            if len(self.audio_buffer) == 0:
-                # Signal that we need more data
-                self.buffer_event.clear()
-        else:
-            # No data available, output silence
+        # If silencing, output zeros
+        if self.silence_output:
             outdata.fill(0)
-            # Signal that we need data
-            self.buffer_event.clear()
+            return
 
-    def _playback_worker(self):
+        # Use lock when accessing the buffer
+        with self.stream_lock:
+            # If we have data in our buffer, play it
+            if self.audio_buffer is not None and len(self.audio_buffer) > 0 and not self.silence_output:
+                if len(self.audio_buffer) >= frames:
+                    # We have enough data
+                    outdata[:] = self.audio_buffer[:frames].reshape(-1, 1)
+                    # Remove the data we just played
+                    self.audio_buffer = self.audio_buffer[frames:]
+                else:
+                    # Not enough data, pad with zeros
+                    outdata[:len(self.audio_buffer)] = self.audio_buffer.reshape(-1, 1)
+                    outdata[len(self.audio_buffer):] = 0
+                    self.audio_buffer = np.array([])
+
+                if len(self.audio_buffer) == 0:
+                    # Signal that we need more data
+                    self.buffer_event.clear()
+            else:
+                # No data available, output silence
+                outdata.fill(0)
+                # Signal that we need data
+                self.buffer_event.clear()
+
+    def _playback_worker(self, thread_id):
         """Worker thread that manages continuous audio playback"""
         try:
+            logger.info(f"Playback worker started with thread ID: {thread_id}")
+
+            # Check if this is still the current thread
+            if thread_id != self.current_thread_id:
+                logger.info(f"Thread {thread_id} is obsolete, exiting")
+                return
+
             # Initialize audio buffer
             self.audio_buffer = np.array([])
 
             # Create and start the output stream
             with self.stream_lock:
+                # Check again if this thread is still current
+                if thread_id != self.current_thread_id:
+                    logger.info(f"Thread {thread_id} is obsolete before stream creation, exiting")
+                    return
+
                 self.stream = sd.OutputStream(
                     samplerate=self.sample_rate,
                     channels=1,
@@ -189,24 +254,43 @@ class AutomaticAudioPlayer:
                 )
                 self.stream.start()
 
-            logger.info("Audio playback stream started")
+            logger.info(f"Audio playback stream started for thread {thread_id}")
 
-            while self.is_playing:
+            while self.is_playing and thread_id == self.current_thread_id:
+                # Check if our thread is still current
+                if thread_id != self.current_thread_id:
+                    logger.info(f"Thread {thread_id} is no longer current, exiting")
+                    break
+
+                # Don't get new audio while silencing
+                if self.silence_output:
+                    time_module.sleep(0.05)
+                    continue
+
                 # Check if we need to fill the buffer
-                if len(self.audio_buffer) < self.sample_rate * 0.5:  # Buffer less than 0.5 seconds
+                buffer_size = 0
+                with self.stream_lock:
+                    buffer_size = len(self.audio_buffer)
+
+                if buffer_size < self.sample_rate * 0.5:  # Buffer less than 0.5 seconds
                     # Try to get more audio data
                     try:
                         # Non-blocking get with timeout
                         samples = self.audio_queue.get(timeout=0.1)
 
+                        # Skip if we started silencing or thread is obsolete
+                        if self.silence_output or thread_id != self.current_thread_id:
+                            continue
+
                         # Append to our buffer
                         if len(samples) > 0:
-                            if len(self.audio_buffer) == 0:
-                                self.audio_buffer = samples
-                            else:
-                                self.audio_buffer = np.append(self.audio_buffer, samples)
+                            with self.stream_lock:
+                                if len(self.audio_buffer) == 0:
+                                    self.audio_buffer = samples
+                                else:
+                                    self.audio_buffer = np.append(self.audio_buffer, samples)
 
-                            logger.debug(f"Buffer filled: {len(self.audio_buffer)} samples")
+                            logger.debug(f"Buffer filled: {len(samples)} samples")
                             self.buffer_event.set()
                     except queue.Empty:
                         # No data available yet, wait a bit
@@ -216,16 +300,18 @@ class AutomaticAudioPlayer:
                     self.buffer_event.wait(0.1)
 
         except Exception as e:
-            logger.exception(f"Playback worker error: {e}")
+            logger.exception(f"Playback worker error in thread {thread_id}: {e}")
         finally:
-            # Ensure stream is closed on exit
+            # Ensure stream is closed on exit if this is still the current thread
             with self.stream_lock:
-                if self.stream is not None:
+                if thread_id == self.current_thread_id and self.stream is not None and self.stream.active:
                     try:
-                        if self.stream.active:
-                            self.stream.stop()
+                        self.stream.stop()
                         self.stream.close()
+                        logger.info(f"Stream closed by thread {thread_id}")
                     except Exception as e:
-                        logger.warning(f"Error closing stream: {e}")
+                        logger.warning(f"Error stopping stream in thread {thread_id}: {e}")
                     finally:
                         self.stream = None
+
+            logger.info(f"Playback worker thread {thread_id} exited")
