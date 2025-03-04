@@ -34,5 +34,5 @@ HEADERS = [
 
 # Audio configuration
 CHANNELS = 1  # Mono audio
-RATE = 16000  # Sample rate for recording (16kHz)
-MAX_RECORD_SECONDS = 30  # Maximum recording time
+RATE = 24000  # 24kHz sample rate (OpenAI standard)
+MAX_RECORD_SECONDS = 60  # Maximum recording time for safety
