@@ -1,9 +1,10 @@
+# realtime/llm/client.py
 import json
 import os
 import threading
 import time
 import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from loguru import logger
 import websocket
@@ -12,12 +13,17 @@ from realtime.hardware.player import AudioPlayer
 from realtime.hardware.recorder import AudioRecorder
 from realtime.utils.config import HEADERS, REALTIME_URL
 from realtime.utils.constants import CONVERSATION_DIR
+from realtime.handler.factory import EventHandlerFactory
+from realtime.service.response_creator import ResponseCreator
+from realtime.service.audio_processor import AudioProcessor
+from realtime.service.bargein_handler import BargeinHandler
 
 
 class RealtimeClient:
-    """Client for the OpenAI Realtime API with improved barge-in support, custom instructions and response recording"""
+    """Client for the OpenAI Realtime API with improved architecture to avoid circular imports"""
 
     def __init__(self, default_instructions: str = "Please assist the user."):
+        # Initialize hardware components
         self.ws = None
         self.player = AudioPlayer()
         self.recorder = AudioRecorder(
@@ -26,21 +32,39 @@ class RealtimeClient:
             min_speech_duration=0.5,  # Require at least 0.5 seconds of speech
             pre_buffer_duration=0.5  # Keep 0.5 seconds before speech detection
         )
+
+        # Initialize connection state
         self.connected = False
         self.current_event_id = 0
-        self.processing_input = False  # Flag to prevent overlapping processing
-        self.assistant_speaking = False  # Flag to track if assistant is speaking
-        self.current_response_id = None  # Track the current response ID
-        self.expecting_audio = False  # Flag to track if we're expecting new audio
-        self.first_audio_chunk = True  # Flag to track first audio chunk in response
-        self.default_instructions = default_instructions  # Store default instructions
 
-        # Response recording settings
+        # Initialize default instructions
+        self.default_instructions = default_instructions
+
+        # Initialize response recording settings
         self.output_dir = CONVERSATION_DIR
-
-        # Store current text response
-        self.current_response_text = ""
         self.conversation_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Initialize client state
+        self.state = {
+            'processing_input': False,
+            'assistant_speaking': False,
+            'current_response_id': None,
+            'expecting_audio': False,
+            'first_audio_chunk': True,
+            'current_response_text': ""
+        }
+
+        # Initialize handler factory
+        EventHandlerFactory.initialize_default_handlers()
+
+    def update_state(self, state_updates: Dict[str, Any]) -> None:
+        """
+        Update the client state
+
+        Args:
+            state_updates: Dictionary of state values to update
+        """
+        self.state.update(state_updates)
 
     def connect(self):
         """Connect to the Realtime API"""
@@ -54,90 +78,24 @@ class RealtimeClient:
                 event = json.loads(message)
                 event_type = event.get("type")
 
-                if event_type == "input_audio_buffer.speech_started":
-                    logger.success("Speech detected in input audio buffer")
+                # Get the appropriate handler for this event type
+                handler = EventHandlerFactory.get_handler(event_type)
 
-                elif event_type == "input_audio_buffer.committed":
-                    logger.success("Input audio buffer committed")
+                # Prepare common kwargs for all handlers
+                kwargs = {
+                    'player': self.player,
+                    'recorder': self.recorder,
+                    'state_updater': self.update_state,
+                    'client_state': self.state,
+                    'output_dir': self.output_dir,
+                    'save_response_callback': self._save_response_text,
+                    'send_event_callback': self.send_event,
+                    'logger': logger.info,
+                    'default_instructions': self.default_instructions
+                }
 
-                elif event_type == "conversation.item.created":
-                    logger.success(f"Conversation item created: {json.dumps(event.get('item', {}), indent=2)}")
-
-                elif event_type == "response.created":
-                    logger.success(f"Response created: {json.dumps(event.get('response', {}), indent=2)}")
-                    self.current_response_id = event.get("response").get("id")
-                    # Will expect audio for this response
-                    self.expecting_audio = True
-                    self.first_audio_chunk = True
-                elif event_type == "rate_limits.updated":
-                    logger.success(f"Rate limits updated: {json.dumps(event.get('rate_limits', {}), indent=2)}")
-
-                elif event_type == "response.output_item.added":
-                    logger.success(f"Output item added: {json.dumps(event.get('item', {}), indent=2)}")
-
-                elif event_type == "response.content_part.added":
-                    logger.success(f"Content part added: {json.dumps(event.get('part', {}), indent=2)}")
-
-                elif event_type == "response.audio.delta":
-                    logger.success(f"Audio delta updated: Response ID {event.get('response_id')}, Item ID {event.get('item_id')}")
-                    # If this is the first audio chunk, force restart the player
-                    if self.first_audio_chunk or self.expecting_audio:
-                        logger.info("First audio delta received - force restarting player")
-                        self.player.force_restart()
-                        self.first_audio_chunk = False
-                        self.expecting_audio = False
-                    self.assistant_speaking = True  # Mark that assistant is speaking
-                    # Get the audio data directly from the delta field
-                    audio_data = event.get("delta", "")
-                    logger.info(f"Processing audio delta of size: {len(audio_data)} bytes")
-                    if audio_data:
-                        self.player.add_audio(audio_data)
-                    else:
-                        logger.warning("Audio delta contained no audio data")
-
-                elif event_type == "response.audio_transcript.delta":
-                    logger.success(f"Audio transcript delta updated: {event.get('delta', {})}")
-                    text = event.get("delta", {})
-                    # Append to the current response text
-                    self.current_response_text += text
-                    # If recording is enabled, save the text incrementally
-                    if self.output_dir and self.current_response_id:
-                        self._save_response_text()
-
-                elif event_type == "error":
-                    error = event.get("error", {})
-                    logger.error(f"Error: {error.get('message', 'Unknown error')}")
-
-                elif event_type == "response.done":
-                    logger.success("Response complete.")
-
-                    # Final save of the response text
-                    if self.output_dir and self.current_response_text:
-                        self._save_response_text(final=True)
-
-                    # Reset response text for next interaction
-                    self.current_response_text = ""
-
-                    # Reset flags when response is complete
-                    self.processing_input = False
-                    self.assistant_speaking = False
-                    self.current_response_id = None
-                    self.first_audio_chunk = True
-                    self.expecting_audio = False
-
-                    self.send_event("session.update", {
-                        "session": {
-                            "tools": [],
-                            "temperature": 1.0
-                        }
-                    })
-
-                elif event_type == "session.updated":
-                    logger.info("Session configuration updated.")
-
-                # For debugging other event types
-                else:
-                    logger.info(f"Event: {event_type}")
+                # Handle the event
+                handler.handle(event, **kwargs)
 
             except Exception as e:
                 logger.exception(f"Error processing message: {e}")
@@ -177,9 +135,8 @@ class RealtimeClient:
         # Start the audio player
         self.player.start()
 
-        # Set up recorder callback with barge-in support
+        # Set up recorder callbacks
         self.recorder.set_recording_finished_callback(self.process_recorded_audio)
-        # Set up speech detection callback for barge-in detection
         self.recorder.set_speech_detected_callback(self.handle_barge_in)
 
     def disconnect(self):
@@ -191,7 +148,13 @@ class RealtimeClient:
         self.recorder.stop_listening()
 
     def send_event(self, event_type: str, data: Dict[str, Any] = None) -> None:
-        """Send an event to the Realtime API"""
+        """
+        Send an event to the Realtime API
+
+        Args:
+            event_type: The type of event to send
+            data: Additional data for the event
+        """
         if not self.ws or not self.connected:
             logger.warning("Not connected to the API")
             return
@@ -206,111 +169,28 @@ class RealtimeClient:
         logger.debug(f"Sending event: {json.dumps(event, indent=2)}")
         self.ws.send(json.dumps(event))
 
-    def create_response(self, instructions: Optional[str] = None, modalities: list = None):
-        """Create a response with custom instructions"""
-        if not modalities:
-            modalities = ["text", "audio"]  # Default to both text and audio
+    def _save_response_text(self, final: bool = False):
+        """
+        Save the current response text to a file
 
-        # Use provided instructions or fall back to default
-        instructions_text = instructions if instructions is not None else self.default_instructions
-
-        logger.info(f"Creating response with instructions: {instructions_text}")
-
-        # Create a response with custom instructions
-        self.send_event("response.create", {
-            "response": {
-                "modalities": modalities,
-                "instructions": instructions_text
-            }
-        })
-
-        # Set flag to expect new audio
-        self.expecting_audio = True
-        self.first_audio_chunk = True
-
-    def handle_barge_in(self):
-        """Handle barge-in with complete player stopping"""
-        if self.assistant_speaking:
-            logger.info("BARGE-IN DETECTED: User started speaking while assistant was talking")
-
-            # Cancel the current response if there is one
-            if self.current_response_id:
-                logger.info(f"Canceling response {self.current_response_id} due to barge-in")
-                try:
-                    self.send_event("response.cancel", {"response_id": self.current_response_id})
-                except Exception as e:
-                    logger.warning(f"Error canceling response: {e}")
-
-            # Force kill the player completely
-            self.player.stop()
-
-            # Wait a small amount of time to ensure clean shutdown
-            time.sleep(0.1)
-
-            # Start a new player instance
-            self.player.start()
-
-            # Reset assistant speaking flag
-            self.assistant_speaking = False
-
-            # Show visual indicator of barge-in
-            print("\n[User interrupted - listening...]")
-
-    def process_recorded_audio(self, custom_instructions: Optional[str] = None):
-        """Process the recorded audio data when recording finished"""
-        # Avoid processing multiple inputs simultaneously
-        if self.processing_input:
-            logger.warning("Already processing input, skipping...")
+        Args:
+            final: Whether this is the final save for the response
+        """
+        if not self.output_dir or not self.state.get('current_response_text'):
             return
 
-        self.processing_input = True
-
-        try:
-            audio_data = self.recorder.get_base64_audio()
-            if not audio_data:
-                logger.warning("No audio recorded, skipping.")
-                self.processing_input = False
-                return
-
-            logger.info(f"Processing recorded audio ({len(audio_data)} bytes)...")
-
-            # Completely stop the player for new input
-            if self.assistant_speaking:
-                # Stop the player and wait for it to fully stop
-                self.player.stop()
-                time.sleep(0.1)
-                self.player.start()
-                self.assistant_speaking = False
-
-            # Append the audio to the input buffer
-            self.send_event("input_audio_buffer.append", {"audio": audio_data})
-
-            # Commit the audio buffer
-            self.send_event("input_audio_buffer.commit")
-
-            # Create a response with custom instructions if provided
-            self.create_response(instructions=custom_instructions)
-
-            # Clear the recording for the next interaction
-            self.recorder.clear_recording()
-
-        except Exception as e:
-            logger.exception(f"Error processing recorded audio: {e}")
-            self.processing_input = False
-
-    def _save_response_text(self, final: bool = False):
-        """Save the current response text to a file"""
-        if not self.output_dir or not self.current_response_text:
+        current_response_id = self.state.get('current_response_id')
+        if not current_response_id:
             return
 
         # Create a filename based on the response ID and whether this is the final version
-        filename_prefix = f"response_{self.conversation_id}_{self.current_response_id}"
+        filename_prefix = f"response_{self.conversation_id}_{current_response_id}"
         filename = f"{filename_prefix}_final.txt" if final else f"{filename_prefix}_partial.txt"
         filepath = os.path.join(self.output_dir, filename)
 
         try:
             with open(filepath, 'w', encoding='utf-8') as f:
-                f.write(self.current_response_text)
+                f.write(self.state.get('current_response_text', ''))
 
             if final:
                 logger.info(f"Saved final response to {filepath}")
@@ -322,8 +202,88 @@ class RealtimeClient:
         except Exception as e:
             logger.error(f"Error saving response text: {e}")
 
-    def run_conversation(self, instructions: Optional[str] = None):
-        """Run an interactive conversation with automatic voice detection and optional custom instructions"""
+    def create_response(self, instructions: Optional[str] = None,
+                        modalities: List[str] = None,
+                        voice: str = "sage",
+                        output_audio_format: str = "pcm16",
+                        tools: List[Dict] = None,
+                        tool_choice: str = "auto",
+                        temperature: float = 0.8,
+                        max_output_tokens: int = 1024):
+        """
+        Create a response with customizable parameters
+
+        Args:
+            instructions: Custom instructions for the assistant
+            modalities: Response modalities
+            voice: Voice to use for audio responses
+            output_audio_format: Format for audio output
+            tools: List of tools available to the assistant
+            tool_choice: Tool selection strategy
+            temperature: Temperature setting for response generation
+            max_output_tokens: Maximum number of tokens to generate
+        """
+        ResponseCreator.create(
+            send_event_callback=self.send_event,
+            default_instructions=self.default_instructions,
+            state_updater=self.update_state,
+            instructions=instructions,
+            modalities=modalities,
+            voice=voice,
+            output_audio_format=output_audio_format,
+            tools=tools,
+            tool_choice=tool_choice,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens
+        )
+
+    def handle_barge_in(self):
+        """Handle barge-in with complete player stopping"""
+        BargeinHandler.handle(
+            send_event_callback=self.send_event,
+            player=self.player,
+            state_updater=self.update_state,
+            client_state=self.state
+        )
+
+    def process_recorded_audio(self, **kwargs):
+        """
+        Process the recorded audio data when recording finished
+
+        Args:
+            **kwargs: Parameters for response creation including instructions, voice, etc.
+        """
+        # Create processor kwargs from client properties
+        processor_kwargs = {
+            'send_event_callback': self.send_event,
+            'recorder': self.recorder,
+            'player': self.player,
+            'state_updater': self.update_state,
+            'default_instructions': self.default_instructions,
+            'client_state': self.state,
+        }
+
+        # Add any additional parameters from the function call
+        processor_kwargs.update(kwargs)
+
+        # Process the audio with all parameters
+        AudioProcessor.process(**processor_kwargs)
+
+    def run_conversation(self, instructions: Optional[str] = None,
+                         voice: str = "sage",
+                         tools: List[Dict] = None,
+                         temperature: float = 0.8,
+                         max_output_tokens: int = 1024):
+        """
+        Run an interactive conversation with automatic voice detection
+
+        Args:
+            instructions: Custom instructions for the assistant
+            voice: Voice to use for audio responses
+            tools: List of tools available to the assistant
+            temperature: Temperature setting for response generation
+            max_output_tokens: Maximum number of tokens to generate
+        """
         try:
             if instructions:
                 print(f"\nStarting conversation with instructions: '{instructions}'")
@@ -336,15 +296,27 @@ class RealtimeClient:
             print("You can interrupt the assistant by speaking while it's talking.")
             print("(Press Ctrl+C to exit)\n")
 
-            # Store instructions for this conversation
-            conversation_instructions = instructions if instructions else self.default_instructions
+            # Store conversation configuration
+            conversation_config = {}
 
-            # Override the recorder's callback to include these instructions
-            def process_with_instructions():
-                self.process_recorded_audio(conversation_instructions)
+            # Only add parameters that are not None
+            if instructions is not None:
+                conversation_config['instructions'] = instructions
+            if voice:
+                conversation_config['voice'] = voice
+            if tools:
+                conversation_config['tools'] = tools
+            if temperature:
+                conversation_config['temperature'] = temperature
+            if max_output_tokens:
+                conversation_config['max_output_tokens'] = max_output_tokens
+
+            # Create a callback that will use these parameters
+            def process_with_config():
+                self.process_recorded_audio(**conversation_config)
 
             # Update the callback
-            self.recorder.set_recording_finished_callback(process_with_instructions)
+            self.recorder.set_recording_finished_callback(process_with_config)
 
             # Start listening for voice
             self.recorder.start_listening()
